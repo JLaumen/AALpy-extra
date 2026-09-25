@@ -60,6 +60,15 @@ pip install ".[stormpy]"
 Installs AALpy-extra together with `stormpy`, enabling the Storm model
 checking interface.
 
+### With SAT-Based Learning
+
+```bash
+pip install ".[python-sat]"
+```
+
+Installs AALpy-extra together with `python-sat`, enabling the SAT-based
+incomplete-teacher learner.
+
 ### Everything
 
 ```bash
