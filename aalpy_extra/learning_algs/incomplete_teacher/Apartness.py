@@ -58,7 +58,7 @@ class Apartness:
             ``True`` if a known output difference can be observed from the
             two states, otherwise ``False``.
         """
-        return (Apartness._show_states_are_apart_moore(state1, state2, observation_tree.alphabet, ) is not None)
+        return Apartness._show_states_are_apart_moore(state1, state2, observation_tree.alphabet, ) is not None
 
     @staticmethod
     def _show_states_are_apart_moore(first: Any, second: Any, alphabet: list[Any], ) -> Any | None:
@@ -136,7 +136,7 @@ class Apartness:
 
     @staticmethod
     def compute_witness_in_tree_and_hypothesis_states(observation_tree: Any, observation_tree_state: Any,
-            hypothesis_state: Any, ) -> list[Any] | None:
+                                                      hypothesis_state: Any, ) -> list[Any] | None:
         """Find a distinguishing sequence between a tree and DFA state.
 
         Args:
@@ -149,11 +149,11 @@ class Apartness:
             is currently known.
         """
         return Apartness.compute_witness_in_tree_and_hypothesis_states_moore(observation_tree, observation_tree_state,
-            hypothesis_state, )
+                                                                             hypothesis_state, )
 
     @staticmethod
     def compute_witness_in_tree_and_hypothesis_states_moore(observation_tree: Any, observation_tree_state: Any,
-            hypothesis_state: Any, ) -> list[Any] | None:
+                                                            hypothesis_state: Any, ) -> list[Any] | None:
         """Compare an incomplete observation tree with a DFA hypothesis."""
         pairs = deque([(observation_tree_state, hypothesis_state)])
 
@@ -166,7 +166,7 @@ class Apartness:
             tree_output = tree_state.output
 
             # Unknown/unobserved tree outputs cannot distinguish a hypothesis.
-            if (tree_output is not None and tree_output.is_known()):
+            if tree_output is not None and tree_output.is_known():
                 hypothesis_output = hyp_state.is_accepting
                 tree_accepts = tree_output is DCValue.TRUE
 

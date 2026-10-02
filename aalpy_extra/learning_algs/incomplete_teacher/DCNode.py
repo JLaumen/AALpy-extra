@@ -54,7 +54,7 @@ class DCNode:
     def __str__(self):
         compact_counter_examples = True
 
-        if (compact_counter_examples and self.output is None and len(self.successors) == 1):
+        if compact_counter_examples and self.output is None and len(self.successors) == 1:
             successor = next(iter(self.successors.values()))
             return str(successor)
 
