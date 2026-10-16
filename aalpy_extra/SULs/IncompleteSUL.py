@@ -1,3 +1,7 @@
+"""System under learning backed by a finite, partial set of labelled words."""
+
+from __future__ import annotations
+
 from collections import defaultdict
 from typing import Any
 
@@ -9,9 +13,15 @@ class IncompleteSUL:
 
     Words explicitly contained in the dataset are assigned ``TRUE`` or
     ``FALSE``. All other words return ``DCValue.DC``.
+
+    Attributes:
+        words: Known value of each word; looking up any other word yields
+            ``DCValue.DC``.
+        num_queries: Number of calls to :meth:`query`.
+        num_steps: Total length of all queried words.
     """
 
-    def __init__(self, words: list[tuple[tuple[Any, ...], bool]], ) -> None:
+    def __init__(self, words: list[tuple[tuple[Any, ...], bool]]) -> None:
         """Initialize the incomplete system.
 
         Args:
@@ -22,7 +32,7 @@ class IncompleteSUL:
         self.words: defaultdict[tuple[Any, ...], DCValue] = defaultdict(lambda: DCValue.DC)
 
         for word, value in words:
-            self.words[word] = (DCValue.TRUE if value else DCValue.FALSE)
+            self.words[word] = DCValue.TRUE if value else DCValue.FALSE
 
         self.num_queries = 0
         self.num_steps = 0
