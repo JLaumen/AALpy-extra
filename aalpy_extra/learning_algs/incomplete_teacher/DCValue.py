@@ -1,3 +1,7 @@
+"""Three-valued outputs for observations from an incomplete teacher."""
+
+from __future__ import annotations
+
 from enum import Enum
 from typing import Any
 
@@ -12,14 +16,18 @@ class DCValue(Enum):
     Note:
         Equality involving ``DC`` is intentionally non-standard: both
         ``DCValue.DC == DCValue.TRUE`` and
-        ``DCValue.DC == DCValue.FALSE`` evaluate to ``True``. Consequently,
-        this type should not be used as a normal key in dictionaries or as a
-        member of sets.
+        ``DCValue.DC == DCValue.FALSE`` evaluate to ``True``. Because this
+        relation is not transitive, the type is deliberately unhashable and
+        cannot be used as a dictionary key or set member. Compare members
+        with ``is`` when the exact value matters.
     """
 
     TRUE = True
     FALSE = False
     DC = None
+
+    # Defining ``__eq__`` already removes the inherited hash; this makes it explicit.
+    __hash__ = None  # type: ignore[assignment]
 
     def is_known(self) -> bool:
         """Return whether this value represents a known Boolean value.

@@ -1,10 +1,22 @@
+"""Run the L#-square benchmarks and write one CSV row of measurements per benchmark.
+
+Usage::
+
+    python benchmarking/lsharp_square/run_lsharp_square_benchmarks.py [-j N] [-t TIMEOUT] [--until-test N]
+
+Each benchmark runs in its own process, which is stopped after ``TIMEOUT`` seconds when ``-t`` is given.
+Results are written to ``benchmarking/lsharp_square/results/lsharp_square_<random id>.csv``.
+"""
+
 import argparse
 import concurrent.futures
+import functools
 import logging
+import multiprocessing
 import re
 import secrets
 import sys
-from multiprocessing.spawn import freeze_support
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +33,27 @@ BENCHMARKS_PATH = PROJECT_ROOT / "benchmarking" / "lsharp_square" / "benchmarks"
 RESULTS_PATH = PROJECT_ROOT / "benchmarking" / "lsharp_square" / "results"
 TEST_NUMBER = re.compile(r"^randm(?P<number>\d{2})")
 
+# Keys of the ``run_lsharp_square`` info dict written after the file name, in CSV column order.
+INFO_COLUMNS = ("successful", "timed_out", "learning_rounds", "automaton_size", "learning_time", "solver_time", "eq_oracle_time",
+                "total_time", "membership_queries", "validity_query", "nodes", "informative_nodes", "sul_steps",
+                "queries_eq_oracle", "steps_eq_oracle")
+CSV_HEADER = ",".join(("file_name",) + INFO_COLUMNS) + "\n"
+# Values of a benchmark stopped at the timeout; its measurements are left empty.
+TIMED_OUT_INFO = {column: "" for column in INFO_COLUMNS} | {"successful": False, "timed_out": True}
+
+# Benchmarks run in child processes, which are started from worker threads when running in parallel.
+# Forking a multi-threaded process is unsafe, so children start from a fork server where available.
+MP_CONTEXT = multiprocessing.get_context(
+    "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn")
+
+# Configured at import time so that child processes, which re-import this
+# module, log their progress too.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
 
+
+# ----------------------------------------------------------------------
+# Benchmark parsing
+# ----------------------------------------------------------------------
 
 def get_possible_words(prefix: str, suffix: str, alphabet: list[str]) -> list[tuple[str, ...]]:
     """Expand ``X`` wildcards in a compact benchmark word."""
@@ -36,10 +67,17 @@ def get_possible_words(prefix: str, suffix: str, alphabet: list[str]) -> list[tu
 
 
 def parse_file(filename: Path, horizon: int | None = None) -> tuple[list[tuple[tuple[str, ...], bool]], list[str]]:
-    """Read a benchmark file and return observed words and alphabet."""
+    """Read a benchmark file and return observed words and alphabet.
+
+    Each line holds ``<word>,<label>``, where ``<label>`` is ``+`` for accepted
+    words. Words over ``0``/``1`` may use ``X`` as a wildcard for either
+    symbol; other words are ``;``-separated symbols. The alphabet lists the
+    symbols in order of first appearance.
+    """
     alphabet = ["0", "1"]
     known_words: list[tuple[tuple[str, ...], bool]] = []
     observed_alphabet: list[str] = []
+    observed_symbols: set[str] = set()
 
     with filename.open() as benchmark:
         for line in benchmark:
@@ -59,69 +97,103 @@ def parse_file(filename: Path, horizon: int | None = None) -> tuple[list[tuple[t
                 if horizon is None or len(word) <= horizon:
                     known_words.append((word, output))
                     for symbol in word:
-                        if symbol not in observed_alphabet:
+                        if symbol not in observed_symbols:
+                            observed_symbols.add(symbol)
                             observed_alphabet.append(symbol)
 
     return known_words, observed_alphabet
 
 
-def run_test_case(filename: Path, replace_basis: bool) -> dict[str, Any]:
+# ----------------------------------------------------------------------
+# Running benchmarks
+# ----------------------------------------------------------------------
+
+def run_test_case(filename: Path) -> dict[str, Any]:
     """Run one benchmark and return its measurements."""
     data, alphabet = parse_file(filename)
     sul = IncompleteSUL(data.copy())
     eq_oracle = FiniteDataOracle(alphabet, sul, data.copy())
 
-    learned_dfa, info = run_lsharp_square(alphabet, sul, eq_oracle, return_data=True, replace_basis=replace_basis, )
+    learned_dfa, info = run_lsharp_square(alphabet, sul, eq_oracle, return_data=True)
 
     info["successful"] = learned_dfa is not None and eq_oracle.find_cex(learned_dfa) is None
+    info["timed_out"] = False
     return info
 
 
-def process_file(filename: Path, replace_basis: bool) -> str:
-    """Run one benchmark and format its measurements as a CSV row."""
-    logging.info("Testing %s", filename.name)
-    info = run_test_case(filename, replace_basis)
-    values = [filename.name, info["successful"], info["learning_rounds"], info["automaton_size"], info["learning_time"],
-        info["solver_time"], info["eq_oracle_time"], info["total_time"], info["membership_queries"],
-        info["validity_query"], info["nodes"], info["informative_nodes"], info["sul_steps"], info["queries_eq_oracle"],
-        info["steps_eq_oracle"], ]
+def format_row(filename: Path, info: dict[str, Any]) -> str:
+    """Format the measurements of one benchmark as a CSV row."""
+    values = [filename.name] + [info[column] for column in INFO_COLUMNS]
     return ",".join(map(str, values)) + "\n"
 
 
-CSV_HEADER = ("file_name,successful,learning_rounds,automaton_size,learning_time,"
-              "solver_time,eq_oracle_time,total_time,membership_queries,validity_query,"
-              "nodes,informative_nodes,sul_steps,queries_eq_oracle,steps_eq_oracle\n")
+def process_file(filename: Path, connection: Connection) -> None:
+    """Run one benchmark in a child process and send its CSV row to the parent."""
+    logging.info("Testing %s", filename.name)
+    connection.send(format_row(filename, run_test_case(filename)))
+    connection.close()
 
 
-def run_test_cases_sequential(filenames: list[Path], replace_basis: bool) -> list[str]:
-    """Run benchmark files sequentially in the current process."""
-    return [process_file(filename, replace_basis) for filename in filenames]
+def run_benchmark(filename: Path, timeout: float | None) -> str:
+    """Run one benchmark in a child process and return its CSV row.
+
+    The child is killed if it has not finished after ``timeout`` seconds, and
+    the row then records the benchmark as timed out. Without a timeout, the
+    benchmark runs until it finishes.
+    """
+    receiver, sender = MP_CONTEXT.Pipe(duplex=False)
+    process = MP_CONTEXT.Process(target=process_file, args=(filename, sender))
+    process.start()
+    sender.close()  # The child now holds the only sending end, so the pipe ends when the child exits.
+
+    finished = False
+    try:
+        finished = receiver.poll(timeout)
+        row = receiver.recv() if finished else None
+    except EOFError:
+        row = None  # The child exited without sending a row.
+    finally:
+        if not finished:
+            process.kill()  # Timed out, or waiting was interrupted (e.g. by Ctrl-C).
+        process.join()
+        receiver.close()
+
+    if not finished:
+        logging.warning("%s timed out after %g seconds", filename.name, timeout)
+        return format_row(filename, TIMED_OUT_INFO)
+    if row is None:
+        raise RuntimeError(f"Benchmark {filename.name} exited with code {process.exitcode} without a result")
+    return row
 
 
-def run_test_cases_parallel(filenames: list[Path], replace_basis: bool, jobs: int) -> list[str]:
-    """Run benchmark files in worker processes."""
-    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as executor:
-        return list(executor.map(process_file, filenames, [replace_basis] * len(filenames)))
-
-
-def run_test_cases(replace_basis: bool, jobs: int | None, until_test: int | None) -> None:
-    """Run selected benchmark files and write their measurements."""
+def select_benchmarks(until_test: int | None) -> list[Path]:
+    """Return the sorted benchmark files, optionally limited to ``randm04`` through ``randm<until_test>``."""
     filenames = sorted(BENCHMARKS_PATH.iterdir())
     if until_test is not None:
-        filenames = [filename for filename in filenames if
-            (match := TEST_NUMBER.match(filename.name)) and int(match.group("number")) <= until_test]
+        filenames = [filename for filename in filenames
+                     if (match := TEST_NUMBER.match(filename.name)) and int(match.group("number")) <= until_test]
+    return filenames
+
+
+def run_test_cases(jobs: int | None, until_test: int | None, timeout: float | None) -> None:
+    """Run selected benchmark files, one or ``jobs`` at a time, and write their measurements."""
+    filenames = select_benchmarks(until_test)
+    run = functools.partial(run_benchmark, timeout=timeout)
 
     if jobs is None:
-        rows = run_test_cases_sequential(filenames, replace_basis)
+        rows = [run(filename) for filename in filenames]
         execution = "sequentially"
     else:
-        rows = run_test_cases_parallel(filenames, replace_basis, jobs)
+        # Each worker thread only waits for the child process running its benchmark.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=jobs)
+        try:
+            rows = list(executor.map(run, filenames))  # Rows keep the input order.
+        finally:
+            executor.shutdown(cancel_futures=True)  # Start no further benchmarks after a failure or Ctrl-C.
         execution = f"in parallel with {jobs} worker(s)"
 
-    random = secrets.token_hex(8)
-
     RESULTS_PATH.mkdir(parents=True, exist_ok=True)
-    output_path = RESULTS_PATH / f"lsharp_square_r{replace_basis}_{random}.csv"
+    output_path = RESULTS_PATH / f"lsharp_square_{secrets.token_hex(8)}.csv"
     with output_path.open("w") as output:
         output.write(CSV_HEADER)
         output.writelines(rows)
@@ -129,23 +201,31 @@ def run_test_cases(replace_basis: bool, jobs: int | None, until_test: int | None
     logging.info("Completed %d benchmark(s) %s; results written to %s", len(filenames), execution, output_path)
 
 
-def main(replace_basis: bool = False, jobs: int | None = None, until_test: int | None = None) -> None:
-    """Parse benchmark options and run the selected tests."""
-    run_test_cases(replace_basis, jobs, until_test)
+def main(jobs: int | None = None, until_test: int | None = None, timeout: float | None = None) -> None:
+    """Run the selected benchmarks."""
+    run_test_cases(jobs, until_test, timeout)
 
 
-if __name__ == "__main__":
-    freeze_support()
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the L#-square benchmarks.")
-    parser.add_argument("-r", "--replace-basis", action="store_true",
-                        help="Allow the observation tree to replace its basis.")
     parser.add_argument("-j", "--jobs", type=int, default=None, metavar="N",
-                        help="Run in parallel with N worker processes. Without -j, run sequentially.")
+                        help="Run N benchmarks in parallel. Without -j, run them one at a time.")
+    parser.add_argument("-t", "--timeout", type=float, default=None, metavar="TIMEOUT",
+                        help="Stop each L#-square run after TIMEOUT seconds and record it as timed out. "
+                             "Without -t, runs have no time limit.")
     parser.add_argument("--until-test", type=int, choices=range(4, 24), metavar="N",
                         help="Run tests randm04 through randmN (inclusive). Default: all tests.")
     args = parser.parse_args()
 
     if args.jobs is not None and args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.timeout is not None and args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    return args
 
-    main(replace_basis=args.replace_basis, jobs=args.jobs, until_test=args.until_test)
+
+# Child processes re-import this module under the forkserver and spawn start methods, so the
+# benchmarks must only start behind this guard.
+if __name__ == "__main__":
+    arguments = _parse_args()
+    main(jobs=arguments.jobs, until_test=arguments.until_test, timeout=arguments.timeout)
