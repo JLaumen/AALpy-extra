@@ -7,17 +7,43 @@ examples that use them) and add it to ``EXAMPLES``.
 
 Usage::
 
-    python Example.py                 # run all examples
-    python Example.py lsharp_square   # run the named examples only
+    python Examples.py                 # run all examples
+    python Examples.py lsharp_square   # run the named examples only
 """
 
 import sys
 from collections.abc import Callable
+from pathlib import Path
+
+DATA_PATH = Path(__file__).resolve().parent / "data"
 
 
 # ----------------------------------------------------------------------
 # L#-square
 # ----------------------------------------------------------------------
+
+def _accepts(dfa, word: tuple[str, ...]) -> bool:
+    """Run ``word`` on ``dfa`` and return whether it ends in an accepting state."""
+    dfa.reset_to_initial()
+    for symbol in word:
+        dfa.step(symbol)
+    return dfa.step(None)
+
+
+def _report_lsharp_square(dfa, info: dict, alphabet: list[str], data: list[tuple[tuple[str, ...], bool]]) -> None:
+    """Print the statistics and transitions of a learned DFA and check it against the known words."""
+    print(f"Learned a DFA with {dfa.size} states in {info['learning_rounds']} rounds")
+    print(f"Membership queries: {info['membership_queries']}, equivalence queries: {info['validity_query']}")
+    print(f"Total time: {info['total_time']:.2f}s (SAT solver: {info['solver_time']:.2f}s)")
+    print("Transitions:")
+    for state in dfa.states:
+        kind = "accepting" if state.is_accepting else "rejecting"
+        moves = ", ".join(f"{symbol} -> {state.transitions[symbol].state_id}" for symbol in alphabet)
+        print(f"  {state.state_id} ({kind}): {moves}")
+
+    # The DFA must agree with every known answer.
+    assert all(_accepts(dfa, word) == expected for word, expected in data)
+
 
 def example_lsharp_square() -> None:
     """Learn a DFA from an incomplete teacher with L#-square.
@@ -100,8 +126,6 @@ def example_lsharp_square() -> None:
     import random
     from itertools import product
 
-    from aalpy.automata import Dfa
-
     from aalpy_extra.SULs.IncompleteSUL import IncompleteSUL
     from aalpy_extra.learning_algs.incomplete_teacher.LSharpSquare import run_lsharp_square
     from aalpy_extra.oracles.FiniteDataOracle import FiniteDataOracle
@@ -111,12 +135,6 @@ def example_lsharp_square() -> None:
     def target(word: tuple[str, ...]) -> bool:
         """Hidden target language: the number of ``a`` symbols is a multiple of 3 (needs 3 states)."""
         return word.count("a") % 3 == 0
-
-    def accepts(dfa: Dfa, word: tuple[str, ...]) -> bool:
-        dfa.reset_to_initial()
-        for symbol in word:
-            dfa.step(symbol)
-        return dfa.step(None)
 
     # The teacher knows the label of a few random words of length up to 6 and
     # of all their prefixes. Every other word is a don't-care for the SUL.
@@ -132,17 +150,43 @@ def example_lsharp_square() -> None:
     dfa, info = run_lsharp_square(alphabet, sul, eq_oracle, return_data=True, assume_prefix_closed=True)
 
     print(f"Known words: {len(data)} of {len(candidates)}")
-    print(f"Learned a DFA with {dfa.size} states in {info['learning_rounds']} rounds")
-    print(f"Membership queries: {info['membership_queries']}, equivalence queries: {info['validity_query']}")
-    print(f"Total time: {info['total_time']:.2f}s (SAT solver: {info['solver_time']:.2f}s)")
-    print("Transitions:")
-    for state in dfa.states:
-        kind = "accepting" if state.is_accepting else "rejecting"
-        moves = ", ".join(f"{symbol} -> {state.transitions[symbol].state_id}" for symbol in alphabet)
-        print(f"  {state.state_id} ({kind}): {moves}")
+    _report_lsharp_square(dfa, info, alphabet, data)
 
-    # The DFA must agree with every known answer.
-    assert all(accepts(dfa, word) == expected for word, expected in data)
+
+def example_lsharp_square_from_file() -> None:
+    """Learn a 9-state DFA with L#-square from data loaded from a file.
+
+    ``data/lsharp_square_9_states.csv`` holds one known word per line as
+    ``<word>,<label>``, where ``<word>`` is a string of ``0`` and ``1``
+    symbols (empty for the empty word) and ``<label>`` is ``+`` for accepted
+    words and ``-`` for rejected ones. All other words are don't-care. The
+    data is far from complete, so the first hypotheses are wrong and the
+    equivalence oracle returns counterexamples: learning takes several
+    rounds.
+
+    Requires the optional SAT dependency: ``pip install ".[python-sat]"``.
+    """
+    from aalpy_extra.SULs.IncompleteSUL import IncompleteSUL
+    from aalpy_extra.learning_algs.incomplete_teacher.LSharpSquare import run_lsharp_square
+    from aalpy_extra.oracles.FiniteDataOracle import FiniteDataOracle
+
+    alphabet = ["0", "1"]
+
+    data = []
+    with (DATA_PATH / "lsharp_square_9_states.csv").open() as file:
+        for line in file:
+            if line.strip():
+                word, label = line.strip().rsplit(",", maxsplit=1)
+                data.append((tuple(word), label == "+"))
+
+    sul = IncompleteSUL(data)
+    eq_oracle = FiniteDataOracle(alphabet, sul, data)
+
+    # Assume prefix-closure (the default): an unknown word has only unknown extensions.
+    dfa, info = run_lsharp_square(alphabet, sul, eq_oracle, return_data=True)
+
+    print(f"Known words: {len(data)}")
+    _report_lsharp_square(dfa, info, alphabet, data)
 
 
 # ----------------------------------------------------------------------
@@ -151,6 +195,7 @@ def example_lsharp_square() -> None:
 
 EXAMPLES: dict[str, Callable[[], None]] = {
     "lsharp_square": example_lsharp_square,
+    "lsharp_square_from_file": example_lsharp_square_from_file,
 }
 
 
